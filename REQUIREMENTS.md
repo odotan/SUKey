@@ -44,9 +44,11 @@ A "key" is **a file on a USB stick**. The lock identifies a key by the SHA-256 o
 Two key roles exist:
 
 - **User key** — grants access to unlock. Subject to access rules (expiration, time windows, use-count).
-- **Master key** — grants access to add/remove/sync keys and to view logs, in addition to unlocking. A master key is just a user key with `master: true` in its database entry; nothing on the stick distinguishes it.
+- **Master key** — additionally authorizes key management: adding new keys (via the dual-port provisioning flow, §6.4), removing keys, syncing, and viewing logs. A master key is just a user key with `master: true` in its database entry; nothing on the stick distinguishes it.
 
 A USB stick may carry multiple files. Each file is hashed independently; the highest-privilege match wins.
+
+**Port permissions are asymmetric.** The outside port is **read-only with respect to the key database and lock configuration** — it can authenticate, energize the solenoid, decrement use-counters, and append logs, but it cannot add, remove, or edit key entries, nor change settings. All database and configuration mutations require the inside port. Provisioning a new key (§6.4) uses **both** ports simultaneously: master on the outside for authorization, target stick on the inside for the actual write. This keeps "write to board" capability physically restricted to the inside of the door.
 
 ---
 
@@ -56,7 +58,7 @@ When a stick is inserted, the firmware:
 
 1. Looks for a top-level folder named `key` (case-insensitive: `key`, `Key`, `KEY` all match).
 2. **If the folder exists**, hashes every regular file directly inside it. No size limit.
-3. **If the folder does not exist**, scans the root of the stick and hashes every regular file ≤ 100 KB. Subdirectories are not recursed.
+3. **If the folder does not exist**, scans the root of the stick and hashes every regular file ≤ 100 KB. It also descends **one level** into each immediate subdirectory of the root and hashes every regular file in them ≤ 100 KB. It does **not** recurse beyond that.
 4. Each file becomes one candidate hash.
 
 Discovery + hashing must complete within:
@@ -98,38 +100,46 @@ The database is the single source of truth for "is this key allowed."
 7. **Denied** → LED **red**, log the event, do not energize.
 8. The user pulls the stick / turns the cylinder; either action cuts power.
 
-The outside port has **no display** and **no buttons**. It cannot be used to add or remove keys, regardless of which key is inserted. (Provisioning a new key requires also having the inside flow active — see §6.4.)
+The outside port has **no display** and **no buttons**, and the firmware **never mutates the key database or lock configuration from the outside port path** — even for master keys. The only writes performed on an outside-port grant are decrementing `useLimitRemaining` on the matched entry and appending a log entry. Provisioning a new key requires the inside port (§6.4).
 
 ### 6.2 Inside port — authentication (default)
 
-Identical to §6.1 with two additions:
+Identical to §6.1 with two differences:
 - The OLED shows status text mirroring the LED state ("Welcome", "Granted: <name>", "Denied: <reason>").
-- If the matched key has `master: true`, after granting access the display offers a menu (§6.3) for a short timeout (e.g., 5 s of inactivity) before powering off behavior is up to the user pulling the stick.
+- If the matched key has `master: true`, the firmware does **not** auto-energize the solenoid. Instead, the master menu (§6.3) is shown immediately with "Open door" as the default highlighted item. The user must press the knob to confirm — either to unlock or to pick a management action. This prevents accidental unlocks when the user only meant to manage keys.
 
 ### 6.3 Inside port — master menu
 
 Available only when a master key is the matched key on the inside port. Items:
 
 - **Open door** — same as a normal grant; default selection.
-- **Add keys** — see §6.4.
 - **Remove keys** — list current entries by `name`; user scrolls/selects via knob; confirm to delete.
 - **Sync** — reconcile the lock's key database with the contents of the inserted stick (intended for app-prepared sticks; details in Phase 2). For Phase 1, this is a stub.
 - **View logs** — paginated, scroll via knob.
 
 Selection mechanism: knob press to confirm, knob rotation (if available) or repeated press-to-cycle to navigate. **No on-screen text input** — all configuration is either menu-driven or comes from files on the stick.
 
+**Adding** new keys is *not* a master-menu item. It is a separate flow (§6.4) that requires the master on the outside port and the target stick on the inside port — because the master menu is only entered when a master is on the inside port alone.
+
 ### 6.4 Provisioning a new key (offline, no app)
 
-The flow assumes you want to hand a friend a USB stick that will open the door, without ever connecting anything to a phone or the internet.
+Adding a new key requires **two USB sticks inserted simultaneously**: the master key on the **outside** port (proves authorization), and the **target stick** on the **inside** port (the stick that will become the new key). The outside port is read-only; both writes — to the lock's key database and to the target stick — happen via the inside port.
 
-1. Insert master key on the **inside** port. Master menu appears.
-2. Select **Add keys**.
-3. Display: *"Insert blank stick on outside port"*.
-4. Insert any USB stick on the outside port.
-5. Lock writes a new file (random bytes, e.g., 256 bytes, into a `key/` folder on the stick) and adds the SHA-256 of that file to its database with the access rules currently selected on the display.
-6. Display: *"Done. Remove stick."*
+The firmware decides what mode it is in by inspecting **both ports** at the point of authentication, after USB enumeration completes:
 
-Default access rules for a freshly added key are configurable on-screen before step 4 — at minimum: expiration (none / 1h / 1d / 1w / custom-date) and master flag (default false). More fields can be added later without breaking the schema.
+- **Only outside active** → normal grant flow (§6.1).
+- **Only inside active** → normal grant flow with possible master menu (§6.2 / §6.3).
+- **Both active**, outside-port stick matches a master entry → **provisioning mode** (steps below). The solenoid does **not** energize in this mode.
+- **Both active**, outside-port stick is not a master → fall back to inside-port flow; provisioning is not offered.
+
+Provisioning steps:
+
+1. The inside display shows a provisioning prompt with editable access-rule fields: expiration (none / 1h / 1d / 1w / custom-date) and a **master-flag checkbox** (default unchecked). The user navigates via the knob.
+2. User confirms via knob press.
+3. Lock writes a new file (random bytes, e.g., 256 bytes, into a `key/` folder on the inside stick) and adds the SHA-256 of that file to its database with the chosen access rules.
+4. Display: *"Key added. Remove sticks."*
+
+If the user pulls either stick before confirming, the flow aborts; nothing is written to the stick or the database. More fields can be added to the prompt later without breaking the schema.
 
 ### 6.5 Solenoid timing
 
@@ -140,23 +150,25 @@ Default access rules for a freshly added key are configurable on-screen before s
 
 ### 6.6 Logging
 
-Every authentication attempt — granted or denied — produces one log entry. Stored in internal flash. Conceptual shape (schema in `schemas/`):
+Every event that powers up the MCU produces at least one log entry — including failed authentication attempts, configuration changes, factory resets, and "stick had no candidate files" cases. Stored in internal flash. Conceptual shape (schema in `schemas/`):
 
 - `timestamp`
-- `port` — `"outside"` | `"inside"`
+- `port` — `"outside"` | `"inside"` | `"both"` (provisioning) | `"recovery"` (factory reset)
 - `keyHash` — the candidate hash (or `null` if no candidates were found)
 - `keyName` — name from DB if matched
-- `result` — `"granted"` | `"denied"`
-- `reason` — `"authorized"` | `"unknown_hash"` | `"expired"` | `"outside_time_window"` | `"use_limit_exceeded"` | `"hash_budget_exceeded"` | `"no_files_found"`
+- `result` — `"granted"` | `"denied"` | `"config_change"`
+- `reason` — `"authorized"` | `"unknown_hash"` | `"expired"` | `"outside_time_window"` | `"use_limit_exceeded"` | `"hash_budget_exceeded"` | `"no_files_found"` | `"key_added"` | `"key_removed"` | `"factory_reset"` | `"first_enrollment"`
 - `solenoidActivated` — bool
 
 Logs are stored in a ring buffer sized to fit comfortably in available flash (target: last 1000 entries). Oldest entries are overwritten.
 
-Log export to a master key's stick (write a `logs.json` file on insert) is a master-menu action; details deferred — Phase 1 may simply export-on-every-master-insert.
+Logs export automatically on **every** master-key insertion (inside port, or as part of the dual-port provisioning flow): the firmware writes a `logs.json` file to the root of the master's stick containing the current ring-buffer contents.
 
 ### 6.7 Recovery (lost master key)
 
-A hidden tactile button is accessible only after physically removing the cylinder from the door. Holding this button for ≥ 5 s while powering up performs a **factory reset**: wipes the key database, wipes logs, returns to "no keys enrolled" state. The next stick inserted on the inside port is enrolled as the first master key.
+A hidden tactile button is accessible only after physically removing the cylinder from the door. Holding this button for ≥ 5 s while powering up performs a **factory reset**: wipes the key database, wipes logs, returns to "no keys enrolled" state.
+
+In the empty state, inserting any stick on the **inside** port shows a first-enrollment prompt with editable fields, including a **"Make this a master key"** checkbox (default unchecked) and the same access-rule fields as §6.4. The user confirms via knob; the lock writes a new key file to the stick and adds its hash to the database with whatever was set. Subsequent enrollments use the normal dual-port provisioning flow (§6.4), which requires an existing master — so a user who skips the master checkbox on the very first enrollment will need another factory reset to add more keys.
 
 This mirrors the security model of a regular cylinder lock: physical access to the cylinder body = ability to re-key.
 
